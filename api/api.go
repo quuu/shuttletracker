@@ -143,6 +143,9 @@ func New(cfg Config, ms shuttletracker.ModelService, msg shuttletracker.MessageS
 	// iTRAK data feed endpoint
 	r.Get("/datafeed", api.DataFeedHandler)
 
+
+  r.Get("/tables", api.TableHandler);
+
 	api.handler = r
 
 	return &api, nil
@@ -168,6 +171,10 @@ func (api *API) Run() {
 // IndexHandler serves the index page.
 func (api *API) IndexHandler(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, "static/index.html")
+}
+
+func (api *API) TableHandler(w http.ResponseWriter, r *http.Request){
+  http.ServeFile(w, r, "static/index.html");
 }
 
 // AdminHandler serves the admin page.
