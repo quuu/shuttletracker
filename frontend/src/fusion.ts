@@ -1,6 +1,7 @@
 import UserLocationService from '@/structures/userlocation.service';
 import store from '@/store';
 import ETA from '@/structures/eta';
+import Location from '@/structures/location';
 
 // SocketManager wraps a WebSocket in order to provide guarantees about
 // reliability, reconnections, retries, etc.
@@ -65,6 +66,7 @@ class SocketManager {
             const ws = new WebSocket(this.url);
             ws.onopen = (event) => {
                 // console.log("socket connected", event);
+                store.commit('setFusionConnected', true);
                 resolve(ws);
             };
             ws.onmessage = (event) => {
@@ -77,16 +79,22 @@ class SocketManager {
             };
             ws.onclose = (event) => {
                 // console.log("socket closed", event);
-                this.createSocket().then((newWS) => {
-                    this.ws = newWS;
 
-                    // try to send anything that was queued while the socket was closed
-                    this.flushQueue();
+                store.commit('setFusionConnected', false);
 
-                    for (const callback of this.reconnectCallbacks) {
-                        callback();
-                    }
-                });
+                // try to reconnect after a second
+                setTimeout(() => {
+                    this.createSocket().then((newWS) => {
+                        this.ws = newWS;
+
+                        // try to send anything that was queued while the socket was closed
+                        this.flushQueue();
+
+                        for (const callback of this.reconnectCallbacks) {
+                            callback();
+                        }
+                    });
+                }, 1000);
             };
         });
     }
@@ -97,6 +105,7 @@ export default class Fusion {
     public track = this.generateUUID();
     private callbacks = Array<(message: {}) => any>();
     private subscriptionTopics = new Set<string>();
+    private serverID = null;
 
     constructor() {
         const wsURL = this.relativeWSURL('fusion/');
@@ -117,6 +126,26 @@ export default class Fusion {
     public start() {
         this.ws.open();
 
+        // register server ID changed refresh callback
+        this.registerMessageReceivedCallback((message: any) => {
+            if (message.type !== 'server_id') {
+                return;
+            }
+
+            // store this server ID or check if it has changed
+            if (this.serverID === null) {
+                this.serverID = message.message;
+            } else if (this.serverID !== message.message) {
+                // reload page after a random amount of time
+                const wait = Math.random() * 20;
+                console.log(`Server ID has changed; reloading after ${wait} seconds`);
+
+                setTimeout(() => {
+                    location.reload(true);
+                }, wait * 1000);
+            }
+        });
+
         // register location callback
         UserLocationService.getInstance().registerCallback((position) => {
             if (!store.state.settings.fusionPositionEnabled) {
@@ -134,6 +163,10 @@ export default class Fusion {
             };
             this.ws.send(JSON.stringify(data));
         });
+
+        // subscribe to vehicle location updates
+        this.subscribe('vehicle_location');
+        this.registerMessageReceivedCallback(this.handleVehicleLocations);
 
         // get notified of bus button setting changes so we can subscribe to the topic
         store.watch((state) => state.settings.busButtonEnabled, (newValue, oldValue) => {
@@ -225,6 +258,26 @@ export default class Fusion {
             etas.push(eta);
         }
         store.commit('updateETAs', { vehicleID: message.message.vehicle_id, etas });
+    }
+
+    private handleVehicleLocations(message: any) {
+        if (message.type !== 'vehicle_location') {
+            return;
+        }
+
+        const m = message.message;
+        const location = new Location(
+            m.id,
+            m.vehicle_id,
+            new Date(m.created),
+            new Date(m.time),
+            m.latitude,
+            m.longitude,
+            m.heading,
+            m.speed,
+            m.route_id,
+        );
+        store.commit('updateVehicleLocation', location);
     }
 
     private generateUUID() {

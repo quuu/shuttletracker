@@ -111,31 +111,48 @@ type fusionManager struct {
 	busButtonCount uint64
 
 	em shuttletracker.ETAService
+	ms shuttletracker.ModelService
+
+	// an ID for Fusion clients to tell if they get reconnected to the same server or not
+	id string
 }
 
-func newFusionManager(etaManager shuttletracker.ETAService) *fusionManager {
+func newFusionManager(etaManager shuttletracker.ETAService, ms shuttletracker.ModelService) (*fusionManager, error) {
 	fm := &fusionManager{
 		addClient:          make(chan *fusionClient),
 		removeClient:       make(chan string),
 		clientMsg:          make(chan clientMessage),
-		serverMsg:          make(chan serverMessage, 50),
+		serverMsg:          make(chan serverMessage, 100), // buffer needs to be at least as large as the number of messages that will be sent in any given loop through fusionManager's run() method
 		debug:              make(chan chan *fusionManagerDebug),
 		clients:            map[string]*fusionClient{},
 		tracks:             map[string][]fusionPosition{},
 		subscriptions:      map[string][]string{},
 		subscribeCallbacks: map[string][]func(string){},
 		em:                 etaManager,
+		ms:                 ms,
 	}
 
 	// get notified of new ETAs to push out to the ETA topic
 	etaManager.Subscribe(fm.handleETA)
 
+	// get notified of new vehicle locations to push out
+	locChan := ms.SubscribeLocations()
+	go fm.handleLocations(locChan)
+
 	// add some subscription callbacks (this could be moved into a method on
 	// ETAManager in the future).
 	fm.subscribeCallbacks["eta"] = []func(string){fm.handleETASubscribe}
+	fm.subscribeCallbacks["vehicle_location"] = []func(string){fm.handleVehicleLocationSubscribe}
+
+	// generate a server UUID
+	u, err := uuid.NewV1()
+	if err != nil {
+		return nil, err
+	}
+	fm.id = u.String()
 
 	go fm.run()
-	return fm
+	return fm, nil
 }
 
 // Select handle client connections, disconnections, and messages.
@@ -143,6 +160,15 @@ func newFusionManager(etaManager shuttletracker.ETAService) *fusionManager {
 // Anything run calls should obtain the lock on fusionManager state.
 func (fm *fusionManager) run() {
 	for {
+		// first see if we have any messages to push out
+		select {
+		case sm := <-fm.serverMsg:
+			fm.processServerMessage(sm)
+			continue
+		default:
+		}
+
+		// then handle everything else
 		select {
 		case c := <-fm.addClient:
 			fm.processAddClient(c)
@@ -183,12 +209,40 @@ func (fm *fusionManager) handleETA(eta shuttletracker.VehicleETA) {
 	fm.sendToTopic("eta", fme)
 }
 
+func (fm *fusionManager) handleLocations(locChan chan *shuttletracker.Location) {
+	for location := range locChan {
+		fme := fusionMessageEnvelope{
+			Type:    "vehicle_location",
+			Message: location,
+		}
+		fm.sendToTopic("vehicle_location", fme)
+	}
+}
+
 // this is a callback for Fusion to immediately push out ETAs to newly-subscribed clients
 func (fm *fusionManager) handleETASubscribe(clientID string) {
 	for _, eta := range fm.em.CurrentETAs() {
 		fme := fusionMessageEnvelope{
 			Type:    "eta",
 			Message: eta,
+		}
+		fm.sendToClient(clientID, fme)
+	}
+}
+
+// immediately push out vehicle locations to newly-subscribed clients
+func (fm *fusionManager) handleVehicleLocationSubscribe(clientID string) {
+	// get latest locations for all enabled vehicles
+	locations, err := fm.ms.LatestLocations()
+	if err != nil {
+		log.WithError(err).Error("unable to get latest vehicle locations")
+		return
+	}
+
+	for _, location := range locations {
+		fme := fusionMessageEnvelope{
+			Type:    "vehicle_location",
+			Message: location,
 		}
 		fm.sendToClient(clientID, fme)
 	}
@@ -211,6 +265,13 @@ func decodeFusionMessage(r io.Reader) (string, json.RawMessage, error) {
 // it just needs to be unique) and associate this client with it.
 func (fm *fusionManager) processAddClient(client *fusionClient) {
 	fm.clients[client.id] = client
+
+	fme := fusionMessageEnvelope{
+		Type:    "server_id",
+		Message: fm.id,
+	}
+	fm.sendToClient(client.id, fme)
+
 	go fm.handleClient(client)
 }
 
